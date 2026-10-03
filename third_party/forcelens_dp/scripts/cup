@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+VISUALFORCE_ROOT="${VISUALFORCE_ROOT:-${REPO_ROOT}/../..}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DEVICE="${DEVICE:-}"
+
+source "${SCRIPT_DIR}/lib/common.sh"
+visualforce_init_paths
+
+usage() {
+  cat <<'EOF'
+Paper-cup adaptive-grip commands (no robot policy)
+
+  scripts/cup monitor
+  scripts/cup adaptive
+  scripts/cup render [RUN_DIR|latest]
+  scripts/cup pose capture
+  scripts/cup pose goto
+  scripts/cup pose show
+  scripts/cup pose replace
+
+Run `monitor` first. It latches the teleoperated empty-cup pose and grip, then
+records VisualForce, ARX joint-torque payload estimates, and gripper telemetry
+without changing the gripper. After validating the sign and scale with a known
+load, `adaptive` maps added payload to a small bounded closure increase while
+VisualForce enforces a baseline-relative force limit.
+
+`render` is offline and never connects to the robot. It combines the recorded
+side video and `adaptive_grip.csv` into a 720p dashboard video with large ARX
+load, physical jaw-travel, and VisualForce-rise gauges. It uses the latest run
+when no directory is supplied.
+
+`pose capture` saves one stationary Cartesian pose after the attended inference
+handoff. `pose goto` approaches it through small bounded steps, but only when
+the operator has first teleoperated within 10 cm and 20 degrees. It holds the
+current gripper and never grasps the cup. Return to phone control after
+`CUP SAVED POSE REACHED`, place/grasp the empty cup, then use `adaptive`.
+`pose replace` intentionally overwrites the saved pose; `pose show` is read-only.
+
+This launcher starts only the GPU policy-protocol server. It does not connect to
+or move the robot. On the robot host, use the attended iPhone handoff
+documented in the robot-controller README and run:
+
+  python main.py experiment=cup_adaptive_grip
+
+Environment overrides:
+  DEVICE, PYTHON_BIN, VISUALFORCE_CKPT, SAM2_ROOT, SAM2_CKPT, ROLLOUT_DIR,
+  PORT, CALIBRATION_SAMPLES, FORCE_FILTER_WINDOW, LOAD_FILTER_WINDOW,
+  LOAD_DEADBAND_N, CLOSURE_PER_LOAD_N, FORCE_LIMIT_RISE_N,
+  EMERGENCY_MARGIN_N, CLOSE_STEP, RELEASE_STEP,
+  MIN_INITIAL_CLOSURE, MAX_CLOSURE, MAX_CLOSURE_DELTA, MAX_COMMAND_LEAD,
+  MAX_VALID_LOAD_N, PAYLOAD_TORQUE_SIGN, STATIONARY_VELOCITY_LIMIT,
+  MAX_POSE_ERROR_M, MAX_ROTATION_ERROR_DEGREES, POSE_FILE,
+  POSE_CAPTURE_SAMPLES, POSE_MAX_TRANSLATION_STEP_M,
+  POSE_MAX_ROTATION_STEP_DEGREES, POSE_MAX_START_DISTANCE_M,
+  POSE_MAX_START_ROTATION_DEGREES, POSE_TRACKING_TRANSLATION_LIMIT_M,
+  POSE_TRACKING_ROTATION_LIMIT_DEGREES, POSE_GOAL_TRANSLATION_TOLERANCE_M,
+  POSE_GOAL_ROTATION_TOLERANCE_DEGREES, and POSE_SETTLE_SAMPLES.
+EOF
+}
+
+run_pose_server() {
+  local command="$1"
+  shift
+  local mode="${command}"
+  if [[ "${command}" == "replace" ]]; then
+    mode="capture"
+  fi
+  local pose_file="${POSE_FILE:-${VISUALFORCE_ROOT}/rollouts/cup_adaptive/cup_pose.json}"
+  local args=(
+    --mode "${mode}"
+    --pose-file "${pose_file}"
+  )
+  if [[ "${mode}" != "show" ]]; then
+    args+=(
+      --port "${PORT:-5555}"
+      --stationary-velocity-limit "${STATIONARY_VELOCITY_LIMIT:-0.05}"
+    )
+  fi
+  case "${command}" in
+    capture) args+=(--capture-samples "${POSE_CAPTURE_SAMPLES:-10}") ;;
+    replace)
+      args+=(
+        --capture-samples "${POSE_CAPTURE_SAMPLES:-10}"
+        --overwrite
+      )
+      ;;
+    goto)
+      args+=(
+        --max-translation-step-m "${POSE_MAX_TRANSLATION_STEP_M:-0.005}"
+        --max-rotation-step-degrees "${POSE_MAX_ROTATION_STEP_DEGREES:-2.0}"
+        --max-start-distance-m "${POSE_MAX_START_DISTANCE_M:-0.10}"
+        --max-start-rotation-degrees "${POSE_MAX_START_ROTATION_DEGREES:-20.0}"
+        --tracking-translation-limit-m "${POSE_TRACKING_TRANSLATION_LIMIT_M:-0.02}"
+        --tracking-rotation-limit-degrees "${POSE_TRACKING_ROTATION_LIMIT_DEGREES:-8.0}"
+        --goal-translation-tolerance-m "${POSE_GOAL_TRANSLATION_TOLERANCE_M:-0.003}"
+        --goal-rotation-tolerance-degrees "${POSE_GOAL_ROTATION_TOLERANCE_DEGREES:-1.0}"
+        --settle-samples "${POSE_SETTLE_SAMPLES:-5}"
+      )
+      ;;
+  esac
+  echo "Cup pose server: ${mode}; no learned model will be loaded." >&2
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" cup_pose_server.py "${args[@]}" "$@"
+}
+
+run_server() {
+  local mode="$1"
+  shift
+  if [[ ! -f "${VISUALFORCE_CKPT}" ]]; then
+    echo "VisualForce checkpoint not found: ${VISUALFORCE_CKPT}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SAM2_CKPT}" ]]; then
+    echo "SAM2 checkpoint not found: ${SAM2_CKPT}" >&2
+    exit 1
+  fi
+  visualforce_select_gpu "${CUP_MIN_GPU_FREE_MIB:-8000}" "cup adaptive-grip"
+
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/cup_adaptive}"
+  local args=(
+    --visualforce-ckpt "${VISUALFORCE_CKPT}"
+    --visualforce-root "${VISUALFORCE_ROOT}"
+    --device "${DEVICE}"
+    --port "${PORT:-5555}"
+    --frame-key wrist_image
+    --side-frame-key base_image
+    --mask-mode sam2
+    --sam2-model small
+    --sam2-repo "${SAM2_ROOT}"
+    --sam2-ckpt "${SAM2_CKPT}"
+    --calibration-samples "${CALIBRATION_SAMPLES:-10}"
+    --force-filter-window "${FORCE_FILTER_WINDOW:-5}"
+    --load-filter-window "${LOAD_FILTER_WINDOW:-5}"
+    --load-deadband-n "${LOAD_DEADBAND_N:-0.30}"
+    --closure-per-load-n "${CLOSURE_PER_LOAD_N:-0.025}"
+    --force-limit-rise-n "${FORCE_LIMIT_RISE_N:-3.0}"
+    --emergency-margin-n "${EMERGENCY_MARGIN_N:-0.50}"
+    --close-step "${CLOSE_STEP:-0.0025}"
+    --release-step "${RELEASE_STEP:-0.005}"
+    --min-initial-closure "${MIN_INITIAL_CLOSURE:-0.20}"
+    --max-closure "${MAX_CLOSURE:-0.55}"
+    --max-closure-delta "${MAX_CLOSURE_DELTA:-0.03}"
+    --max-command-lead "${MAX_COMMAND_LEAD:-0.03}"
+    --max-valid-load-n "${MAX_VALID_LOAD_N:-12.0}"
+    --payload-torque-sign "${PAYLOAD_TORQUE_SIGN:-1}"
+    --stationary-velocity-limit "${STATIONARY_VELOCITY_LIMIT:-0.05}"
+    --max-pose-error-m "${MAX_POSE_ERROR_M:-0.03}"
+    --max-rotation-error-degrees "${MAX_ROTATION_ERROR_DEGREES:-8.0}"
+    --rollout-dir "${rollout_dir}"
+  )
+  if [[ "${mode}" == "monitor" ]]; then
+    args+=(--monitor-only)
+  fi
+
+  echo "Cup server: ${mode}; no diffusion-policy checkpoint will be loaded." >&2
+  echo "Wait for CUP CALIBRATION COMPLETE before applying a known load or pouring." >&2
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" adaptive_grip_server.py "${args[@]}" "$@"
+}
+
+case "${1:-help}" in
+  monitor) shift; run_server monitor "$@" ;;
+  adaptive) shift; run_server adaptive "$@" ;;
+  render)
+    shift
+    cd "${REPO_ROOT}"
+    "${PYTHON_BIN}" render_cup_demo.py "$@"
+    ;;
+  pose)
+    shift
+    case "${1:-help}" in
+      capture|replace|goto|show) run_pose_server "$@" ;;
+      help|-h|--help) usage ;;
+      *) echo "Unknown cup pose command: $1" >&2; usage >&2; exit 2 ;;
+    esac
+    ;;
+  help|-h|--help) usage ;;
+  *) echo "Unknown cup command: $1" >&2; usage >&2; exit 2 ;;
+esac

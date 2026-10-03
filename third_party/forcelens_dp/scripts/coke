@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+VISUALFORCE_ROOT="${VISUALFORCE_ROOT:-${REPO_ROOT}/../..}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DEVICE="${DEVICE:-}"
+CKPT_PATH="${CKPT_PATH:-}"
+SOFT_DATASET="${SOFT_DATASET:-data/pick/coke_soft_0821}"
+HARD_DATASET="${HARD_DATASET:-data/pick/coke_hard_0821}"
+DATASET_PATH="${DATASET_PATH:-data/pick/coke_mixed_0821}"
+CALIBRATION_DATASET="${CALIBRATION_DATASET:-data/pick/coke_mixed_0821_force_output}"
+CALIBRATION_REPORT="${CALIBRATION_REPORT:-${VISUALFORCE_ROOT}/reports/coke_tts_calibration.json}"
+
+source "${SCRIPT_DIR}/lib/common.sh"
+visualforce_init_paths
+source "${SCRIPT_DIR}/lib/tts_profiles.sh"
+
+resolve_checkpoint() {
+  if ! resolve_latest_checkpoint \
+      '*train_diffusion_unet_pick_coke_hybrid*/checkpoints/latest.ckpt'; then
+    echo "No Coke diffusion-policy checkpoint found." >&2
+    exit 1
+  fi
+}
+
+common_args() {
+  build_visualforce_common_args
+  COMMON_ARGS+=(
+    --n-action-steps 4
+  )
+}
+
+run_controller() {
+  run_tts "$@"
+}
+
+run_tts() {
+  # Gripper-only policy test-time steering: sample learned action chunks and
+  # score them with the learned force output. Keep the nominal policy arm
+  # trajectory and splice in only the selected candidate's gripper trajectory.
+  # The launcher deliberately adds no direct gripper/contact controller.
+  local desired_force_delta="${1:-${DESIRED_FORCE:-3.0}}"
+  local candidates="${SAMPLING_CANDIDATES:-32}"
+  local score_steps="${SCORE_STEPS:-4}"
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/coke_tts}"
+  if (( $# > 0 )); then shift; fi
+  tts_require_nonnegative desired_force_delta "${desired_force_delta}"
+  tts_require_positive_integer SAMPLING_CANDIDATES "${candidates}"
+  tts_require_positive_integer SCORE_STEPS "${score_steps}"
+  tts_prepare_inference coke "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  build_visualforce_common_args
+  tts_build_queue_args
+  TTS_PROFILE_ARGS=(
+    --tts-experiment-profile coke
+    --tts-desired-force "${desired_force_delta}"
+    --tts-force-target-mode baseline_delta
+    --tts-steering-mode sample
+    --tts-selection-scope gripper
+    --tts-sampling-candidates "${candidates}"
+    --tts-sampling-score-steps "${score_steps}"
+    --tts-policy-force-output
+    --tts-log-candidates
+  )
+  TTS_PROFILE_NAME="gripper-policy-sampling"
+  TTS_PROFILE_TARGET="${desired_force_delta} N rise"
+  TTS_PROFILE_CANDIDATES="${candidates}"
+  COMMON_ARGS+=(
+    "${TTS_QUEUE_ARGS[@]}"
+  )
+  tts_print_profile coke
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    "${TTS_PROFILE_ARGS[@]}" \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_critic_tts() {
+  local desired_force_delta="${1:-${DESIRED_FORCE:-3.0}}"
+  local critic_weight="${2:-${CRITIC_WEIGHT:-1.0}}"
+  local critic_ckpt="${CRITIC_CKPT:-}"
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/coke_critic_tts}"
+  if (( $# > 0 )); then shift; fi
+  if (( $# > 0 )); then shift; fi
+  tts_require_nonnegative desired_force_delta "${desired_force_delta}"
+  tts_require_nonnegative critic_weight "${critic_weight}"
+  tts_prepare_inference coke-critic "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  if [[ ! -f "${critic_ckpt}" ]]; then
+    echo "CRITIC_CKPT must point to the external Coke delta-force critic." >&2
+    exit 1
+  fi
+  build_visualforce_common_args
+  POLICY_ACTION_STEPS="${POLICY_ACTION_STEPS:-16}"
+  tts_build_queue_args
+  local TTS_SELECTION_SCOPE=gripper
+  tts_build_manipulation_profile_args "${desired_force_delta}" 0.0
+  TTS_PROFILE_NAME="gripper-critic-sampling"
+  COMMON_ARGS+=("${TTS_QUEUE_ARGS[@]}")
+  tts_print_profile coke
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    "${TTS_PROFILE_ARGS[@]}" \
+    --tts-delta-force-critic-ckpt "${critic_ckpt}" \
+    --tts-delta-force-critic-weight "${critic_weight}" \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_proxy() {
+  local desired_force="${1:-${DESIRED_FORCE:-2.5}}"
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/coke_legacy_proxy}"
+  if (( $# > 0 )); then shift; fi
+  echo 'Warning: Coke proxy mode uses an absolute visual-force target and is diagnostic-only.' >&2
+  tts_prepare_inference coke-proxy "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  build_visualforce_common_args
+  tts_build_queue_args
+  COMMON_ARGS+=("${TTS_QUEUE_ARGS[@]}")
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    --tts-desired-force "${desired_force}" \
+    --tts-force-target-mode absolute \
+    --tts-close-positive \
+    --tts-steering-mode sample \
+    --tts-selection-scope gripper \
+    --tts-sampling-candidates "${SAMPLING_CANDIDATES:-32}" \
+    --tts-sampling-score-steps "${SCORE_STEPS:-4}" \
+    --tts-action-force-gain 1.0 \
+    --tts-add-gripper-fallback-candidates \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_baseline() {
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/grab_coke_empty_dp}"
+  tts_prepare_inference coke-baseline "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  common_args
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    --tts-desired-force "${DESIRED_FORCE:-0.7}" \
+    --tts-steering-mode monitor \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_calibrate() {
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" tools/coke/calibrate_coke_tts.py \
+    --dataset "${CALIBRATION_DATASET}" \
+    --output "${CALIBRATION_REPORT}" \
+    "$@"
+}
+
+run_diagnose() {
+  resolve_checkpoint
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" tools/coke/diagnose_coke_gripper.py \
+    --checkpoint "${CKPT_PATH}" \
+    --dataset "${CALIBRATION_DATASET}" \
+    "$@"
+}
+
+build_dataset() {
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" tools/coke/build_coke_mixed_dataset.py \
+    --soft-root "${SOFT_DATASET}" \
+    --hard-root "${HARD_DATASET}" \
+    --output "${DATASET_PATH}" \
+    --overwrite
+}
+
+run_train() {
+  cd "${REPO_ROOT}"
+  if [[ "${BUILD_DATASET:-1}" == "1" ]]; then
+    build_dataset
+  fi
+  WANDB_MODE="${WANDB_MODE:-offline}" \
+  WANDB_DISABLE_SERVICE="${WANDB_DISABLE_SERVICE:-true}" \
+  "${PYTHON_BIN}" train.py \
+    --config-name=train_diffusion_unet_pick_coke_hybrid_workspace \
+    name=train_diffusion_unet_pick_coke_hybrid_mixed_0821 \
+    task.name=coke_mixed_0821_image \
+    task.dataset.dataset_path="${DATASET_PATH}" \
+    task.dataset.relative_position_action=false \
+    task.dataset.action_normalizer_mode=limits \
+    task.dataset.agent_pos_normalizer_mode=limits \
+    training.device="${TRAIN_DEVICE:-cuda:0}" \
+    training.resume=false \
+    logging.mode="${WANDB_MODE:-offline}" \
+    'logging.tags=[coke,mixed_0821,soft,hard,absolute]' \
+    "$@"
+}
+
+case "${1:-help}" in
+  controller|force-controller) shift; run_controller "$@" ;;
+  tts) shift; run_tts "$@" ;;
+  tts-critic|critic) shift; run_critic_tts "$@" ;;
+  proxy|legacy-tts) shift; run_proxy "$@" ;;
+  gentle) shift; run_proxy 0.2 "$@" ;;
+  strong) shift; run_proxy 15.0 "$@" ;;
+  baseline|dp) shift; run_baseline "$@" ;;
+  calibrate) shift; run_calibrate "$@" ;;
+  diagnose) shift; run_diagnose "$@" ;;
+  build) build_dataset ;;
+  train) shift; run_train "$@" ;;
+  force-output)
+    shift
+    exec "${SCRIPT_DIR}/train_coke_force_output.sh" "$@"
+    ;;
+  checkpoint)
+    resolve_checkpoint
+    repo_relative_path "${CKPT_PATH}"
+    printf '\n'
+    ;;
+  help|-h|--help)
+    printf '%s\n' \
+      'Coke commands:' \
+      '  scripts/coke tts [force_rise]' \
+      '  scripts/coke tts-critic [force_rise] [critic_weight]  # for 8D checkpoints' \
+      '  scripts/coke controller [force_rise]  # alias for tts' \
+      '  scripts/coke proxy [absolute_force]   # legacy ablation' \
+      '  scripts/coke baseline' \
+      '  scripts/coke calibrate [calibration options...]' \
+      '  scripts/coke diagnose [diagnostic options...]  # offline, no robot motion' \
+      '  scripts/coke gentle' \
+      '  scripts/coke strong' \
+      '  scripts/coke checkpoint' \
+      '  scripts/coke build' \
+      '  scripts/coke train [Hydra overrides...]' \
+      '  scripts/coke force-output {build|label|validate|train|all|dry-run}' \
+      '' \
+      'tts defaults to a 3.0 N baseline-relative learned-force target.' \
+      'It keeps the nominal arm and selects only a gripper trajectory from 32 samples.' \
+      'It adds no direct gripper controller or handcrafted gripper constraint.' \
+      'calibrate is offline-only and never starts policy inference or robot motion.' \
+      '' \
+      'TTS environment overrides: POLICY_ACTION_STEPS, N_ACTION_STEPS,' \
+      '  SAMPLING_CANDIDATES, SCORE_STEPS, DESIRED_FORCE, CRITIC_CKPT,' \
+      '  and CRITIC_WEIGHT.' \
+      'TTS also accepts ACTION_REFILL_STEPS (default 2).' \
+      'Inference selects the GPU with most free memory when DEVICE is unset.' \
+      'TTS_MIN_GPU_FREE_MIB sets the startup free-memory requirement.' \
+      '' \
+      'Training environment overrides: SOFT_DATASET, HARD_DATASET, DATASET_PATH,' \
+      '  TRAIN_DEVICE, PYTHON_BIN, WANDB_MODE, and BUILD_DATASET.' \
+      'Calibration overrides: CALIBRATION_DATASET and CALIBRATION_REPORT.'
+    ;;
+  *) echo "Unknown Coke command: $1" >&2; exit 2 ;;
+esac

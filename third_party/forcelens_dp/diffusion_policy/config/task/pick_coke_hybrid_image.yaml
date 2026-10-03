@@ -1,0 +1,43 @@
+name: pick_coke_hybrid_image
+
+image_size: [240, 320]  # H, W
+image_keys: [base_image, wrist_image]
+dataset_paths:
+  - data/pick/pick_full_coke
+  - data/pick/pick_empty_coke
+  - data/pick/pick_empty_coke_brute
+
+shape_meta: &shape_meta
+  obs:
+    base_image:
+      shape: [3, 240, 320]
+      type: rgb
+    wrist_image:
+      shape: [3, 240, 320]
+      type: rgb
+    agent_pos:
+      shape: [8]
+      type: low_dim
+  action:
+    shape: [8]
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.pick_image_dataset.PickImageDataset
+  dataset_path: ${task.dataset_paths}
+  image_keys: ${task.image_keys}
+  image_size: ${task.image_size}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  relative_position_action: false
+  relative_position_action_mode: action_diff
+  relative_position_anchor_idx: ${eval:'${n_obs_steps}-1'}
+  action_normalizer_mode: limits
+  agent_pos_normalizer_mode: limits
+  normalizer_range_eps: 1e-4
+  val_ratio: 0.1
+  seed: 42
+  max_train_episodes: null

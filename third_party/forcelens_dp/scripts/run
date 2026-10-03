@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'EOF'
+ForceLens DP command center
+
+Interactive:
+  scripts/run
+
+Direct commands:
+  scripts/run berry tts
+  scripts/run berry baseline
+  scripts/run berry checkpoints
+  scripts/run berry replay FORCE_LOG
+  scripts/run flip tts
+  scripts/run flip raw_dp
+  scripts/run flip force-output {prepare|dry-run|train}
+  scripts/run pivot train
+  scripts/run coke tts [force_rise]
+  scripts/run coke controller [force_rise]  # alias for tts
+  scripts/run coke proxy [absolute_force]   # legacy ablation
+  scripts/run coke baseline
+  scripts/run coke calibrate
+  scripts/run coke gentle
+  scripts/run coke strong
+  scripts/run coke train
+  scripts/run coke force-output {build|label|validate|train|all|dry-run}
+  scripts/run plug tts [terminal_force_cap]
+  scripts/run plug baseline
+  scripts/run plug train
+  scripts/run cup monitor
+  scripts/run cup adaptive
+  scripts/run cup render [RUN_DIR|latest]
+  scripts/run cup pose {capture|goto|show|replace}
+
+Task launchers remain available directly as scripts/berry, scripts/flip,
+scripts/pivot, scripts/coke, scripts/plug, and scripts/cup.
+EOF
+}
+
+choose() {
+  local prompt="$1"
+  local max_choice="$2"
+  local default_choice="${3:-}"
+  local answer=""
+  if [[ -n "${default_choice}" ]]; then
+    read -r -p "${prompt} [${default_choice}]: " answer
+    answer="${answer:-${default_choice}}"
+  else
+    read -r -p "${prompt}: " answer
+  fi
+  if [[ "${answer}" == "q" || "${answer}" == "quit" ]]; then
+    exit 0
+  fi
+  if [[ ! "${answer}" =~ ^[1-9][0-9]*$ ]] || (( answer > max_choice )); then
+    echo "Invalid selection: ${answer}" >&2
+    exit 2
+  fi
+  printf '%s' "${answer}"
+}
+
+run_berry_menu() {
+  cat <<'EOF'
+
+Berry
+  1) Force-aware TTS (interactive)
+  2) DP baseline with force monitoring
+  3) List trained checkpoints
+  4) Show automatically selected checkpoint
+  5) Train force-output DP
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 5 1)" in
+    1) exec "${SCRIPT_DIR}/berry" tts ;;
+    2) exec "${SCRIPT_DIR}/berry" baseline ;;
+    3) exec "${SCRIPT_DIR}/berry" checkpoints ;;
+    4) exec "${SCRIPT_DIR}/berry" checkpoint ;;
+    5) exec "${SCRIPT_DIR}/berry" train ;;
+  esac
+}
+
+run_flip_menu() {
+  cat <<'EOF'
+
+Flip
+  1) Force-output TTS
+  2) Raw DP with force monitoring
+  3) Train stage-2 DP
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 3 1)" in
+    1) exec "${SCRIPT_DIR}/flip" tts ;;
+    2) exec "${SCRIPT_DIR}/flip" raw_dp ;;
+    3) exec "${SCRIPT_DIR}/flip" train ;;
+  esac
+}
+
+run_pivot_menu() {
+  cat <<'EOF'
+
+Pivot
+  1) Build success-only dataset
+  2) Train diffusion policy
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 2 2)" in
+    1) exec "${SCRIPT_DIR}/pivot" build ;;
+    2) exec "${SCRIPT_DIR}/pivot" train ;;
+  esac
+}
+
+run_coke_menu() {
+  cat <<'EOF'
+
+Coke
+  1) DP baseline with force monitoring
+  2) Dataset-calibrated grasp TTS (0.7 N rise, 32 candidates)
+  3) Legacy absolute proxy gentle preset (0.2 N)
+  4) Legacy absolute proxy strong preset (15.0 N)
+  5) Build and train mixed soft/hard policy
+  6) Recompute offline TTS calibration
+  7) Build/train paper-compatible 9D force-output policy
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 7 1)" in
+    1) exec "${SCRIPT_DIR}/coke" baseline ;;
+    2) exec "${SCRIPT_DIR}/coke" tts ;;
+    3) exec "${SCRIPT_DIR}/coke" gentle ;;
+    4) exec "${SCRIPT_DIR}/coke" strong ;;
+    5) exec "${SCRIPT_DIR}/coke" train ;;
+    6) exec "${SCRIPT_DIR}/coke" calibrate ;;
+    7) exec "${SCRIPT_DIR}/coke" force-output dry-run ;;
+  esac
+}
+
+run_plug_menu() {
+  cat <<'EOF'
+
+Plug insertion
+  1) DP baseline with force monitoring
+  2) Force-output TTS (full action-chunk selection)
+  3) Train hybrid DP
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 3 1)" in
+    1) exec "${SCRIPT_DIR}/plug" baseline ;;
+    2) exec "${SCRIPT_DIR}/plug" tts ;;
+    3) exec "${SCRIPT_DIR}/plug" train ;;
+  esac
+}
+
+run_cup_menu() {
+  cat <<'EOF'
+
+Paper cup (no robot policy)
+  1) Monitor held empty cup and validate added-load estimate
+  2) Adaptive load-to-VisualForce gripper control
+  q) Back/quit
+EOF
+  case "$(choose 'Action' 2 1)" in
+    1) exec "${SCRIPT_DIR}/cup" monitor ;;
+    2) exec "${SCRIPT_DIR}/cup" adaptive ;;
+  esac
+}
+
+run_direct() {
+  local task="$1"
+  local action="${2:-help}"
+  shift
+  if (( $# > 0 )); then
+    shift
+  fi
+
+  case "${task}:${action}" in
+    berry:*) exec "${SCRIPT_DIR}/berry" "${action}" "$@" ;;
+    flip:*) exec "${SCRIPT_DIR}/flip" "${action}" "$@" ;;
+    pivot:*) exec "${SCRIPT_DIR}/pivot" "${action}" "$@" ;;
+    coke:*) exec "${SCRIPT_DIR}/coke" "${action}" "$@" ;;
+    plug:*) exec "${SCRIPT_DIR}/plug" "${action}" "$@" ;;
+    cup:*) exec "${SCRIPT_DIR}/cup" "${action}" "$@" ;;
+    *)
+      echo "Unknown command: ${task} ${action}" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+if (( $# > 0 )); then
+  case "$1" in
+    help|-h|--help) usage ; exit 0 ;;
+    berry|flip|pivot|coke|plug|cup) run_direct "$@" ;;
+    *) echo "Unknown task: $1" >&2; usage >&2; exit 2 ;;
+  esac
+fi
+
+if [[ ! -t 0 ]]; then
+  echo "Interactive mode requires a terminal; run scripts/run --help." >&2
+  exit 2
+fi
+
+cat <<'EOF'
+ForceLens DP
+  1) Berry picking
+  2) Object flipping
+  3) Object pivoting
+  4) Coke grasping
+  5) Plug insertion
+  6) Paper-cup adaptive grip (no policy)
+  q) Quit
+EOF
+
+case "$(choose 'Task' 6 1)" in
+  1) run_berry_menu ;;
+  2) run_flip_menu ;;
+  3) run_pivot_menu ;;
+  4) run_coke_menu ;;
+  5) run_plug_menu ;;
+  6) run_cup_menu ;;
+esac

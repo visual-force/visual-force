@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+VISUALFORCE_ROOT="${VISUALFORCE_ROOT:-${REPO_ROOT}/../..}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DEVICE="${DEVICE:-}"
+CKPT_PATH="${CKPT_PATH:-}"
+CKPT_PRESET="${CKPT_PRESET:-latest}"
+VISUALFORCE_FRAME_COLOR_SPACE="bgr"
+
+source "${SCRIPT_DIR}/lib/common.sh"
+visualforce_init_paths
+source "${SCRIPT_DIR}/lib/tts_profiles.sh"
+source "${SCRIPT_DIR}/lib/berry_checkpoints.sh"
+source "${SCRIPT_DIR}/lib/berry_tts.sh"
+
+usage() {
+  cat <<'EOF'
+Berry commands
+
+  scripts/berry tts
+  scripts/berry tts --interactive
+  scripts/berry tts --no-interactive
+  scripts/berry tts [desired_force] [activation_force] [last|mean|max]
+  scripts/berry baseline
+  scripts/berry dp
+  scripts/berry train
+  scripts/berry analyze [analysis arguments...]
+  scripts/berry replay FORCE_LOG [replay arguments...]
+  scripts/berry checkpoint
+  scripts/berry checkpoints
+
+Recommended:
+  scripts/berry tts
+
+The launcher discovers berry force-output `latest.ckpt` files under outputs/.
+Interactive TTS asks which one to use and defaults to the newest. Baseline and
+non-interactive TTS use the newest automatically. An exact CKPT_PATH overrides
+automatic discovery for non-interactive commands.
+
+Bare `scripts/berry tts` is interactive. TTS arguments are desired force rise
+in newtons, activation force in newtons, and force aggregation. They can also be
+named with DESIRED_FORCE, ACTIVATION_FORCE, and FORCE_AGGREGATION. Use
+--no-interactive for scripts and automation.
+
+Environment overrides: DEVICE, CKPT_PRESET, CKPT_PATH, PYTHON_BIN, ROLLOUT_DIR,
+DESIRED_FORCE, ACTIVATION_FORCE, FORCE_AGGREGATION, POLICY_ACTION_STEPS,
+N_ACTION_STEPS, SCORE_STEPS, SAMPLING_CANDIDATES, TTS_SELECTION_SCOPE,
+  TTS_GENTLE_GRIPPER_CONTROL, TTS_DIRECT_GRIPPER_SAFETY,
+  TTS_GRIPPER_RELEASE_STEP, TTS_GRIPPER_SAFETY_MIN_POSITION,
+  TTS_CONTACT_FORCE_DELTA, TTS_FORCE_FILTER_WINDOW,
+  TTS_FORCE_BASELINE_MAX_POSITION, TTS_GRIPPER_CLOSE_STEP,
+  TTS_GRIPPER_MAINTAIN_STEP, TTS_GRIPPER_MAX_POSITION,
+  TTS_GRIPPER_MAX_LEAD, TTS_MAX_FORCE_RATE, TTS_FORCE_SAFETY_LIMIT,
+  TTS_GENTLE_DEADBAND, and TTS_GENTLE_STOP_MARGIN.
+Gripper-only selection is the default; set TTS_SELECTION_SCOPE=full to restore
+whole-candidate arm and gripper selection.
+Direct gripper force control is enabled by default. It calibrates the
+open-gripper VisualForce baseline, closes until force rises by
+TTS_CONTACT_FORCE_DELTA, holds inside the target band, and opens above it. The
+DP/TTS gripper proposal does not gate approach or grasp feedback. After contact,
+a stable learned open suffix in the nominal policy chunk latches a full release
+so the berry can be dropped even if force reranking selects a hold candidate. Set
+TTS_GENTLE_GRIPPER_CONTROL=0 only for diagnostic ablations.
+EOF
+}
+
+berry_run_train() {
+  local dataset_path="${DATASET_PATH:-data/pick/berry_stage2_policy_force_output}"
+  cd "${REPO_ROOT}"
+  if [[ "${BUILD_DATASET:-1}" == "1" ]]; then
+    "${PYTHON_BIN}" tools/berry/build_berry_stage2_force_output_dataset.py \
+      --output "${dataset_path}" \
+      --overwrite
+  fi
+  WANDB_MODE="${WANDB_MODE:-offline}" \
+  WANDB_DISABLE_SERVICE="${WANDB_DISABLE_SERVICE:-true}" \
+  "${PYTHON_BIN}" train.py \
+    --config-name=train_diffusion_unet_pick_berries_hybrid_workspace \
+    task=pick_berries_all_image \
+    name=train_diffusion_unet_berry_stage2_absolute_force_output_quantile \
+    task.name=berry_stage2_absolute_force_output_image \
+    task.dataset_path="${dataset_path}" \
+    'task.shape_meta.action.shape=[9]' \
+    task.dataset.relative_position_action=false \
+    task.dataset.relative_gripper_action=false \
+    task.dataset.append_force_to_action=true \
+    task.dataset.force_label_name=visualforce_pseudo_force_fz.npz \
+    task.dataset.force_key=Fz \
+    task.dataset.force_mode=magnitude \
+    task.dataset.action_normalizer_mode=quantile \
+    task.dataset.gripper_action_normalizer_mode=limits \
+    task.dataset.agent_pos_normalizer_mode=quantile \
+    training.device="${TRAIN_DEVICE:-cuda:1}" \
+    training.resume=false \
+    logging.mode=offline \
+    'logging.tags=[berry_stage2,absolute,force_output,quantile,gripper_limits]' \
+    "$@"
+}
+
+command_name="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+case "${command_name}" in
+  help|-h|--help) usage ;;
+  tts) berry_run_tts "$@" ;;
+  baseline|dp) berry_run_baseline "$@" ;;
+  train) berry_run_train "$@" ;;
+  checkpoint)
+    berry_resolve_checkpoint
+    berry_display_checkpoint_path "${CKPT_PATH}"
+    printf '\n'
+    ;;
+  checkpoints) berry_list_checkpoints ;;
+  analyze)
+    cd "${REPO_ROOT}"
+    exec "${PYTHON_BIN}" tools/berry/analyze_force_output_candidate_diversity.py "$@"
+    ;;
+  replay)
+    cd "${REPO_ROOT}"
+    exec "${PYTHON_BIN}" tools/berry/replay_gentle_gripper.py "$@"
+    ;;
+  *) echo "Unknown berry command: ${command_name}" >&2; usage >&2; exit 2 ;;
+esac

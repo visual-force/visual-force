@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+VISUALFORCE_ROOT="${VISUALFORCE_ROOT:-${REPO_ROOT}/../..}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DEVICE="${DEVICE:-}"
+CKPT_PATH="${CKPT_PATH:-}"
+VISUALFORCE_FRAME_COLOR_SPACE="bgr"
+DEFAULT_FORCE_OUTPUT_CKPT=""
+
+source "${SCRIPT_DIR}/lib/common.sh"
+visualforce_init_paths
+source "${SCRIPT_DIR}/lib/tts_profiles.sh"
+
+usage() {
+  cat <<'EOF'
+Flip commands
+
+  scripts/flip tts [force_rise] [activation_force]
+  scripts/flip raw_dp
+  scripts/flip baseline
+  scripts/flip dp
+  scripts/flip checkpoint
+  scripts/flip train
+  scripts/flip force-output {build|label|validate|prepare|train|all|dry-run}
+  scripts/flip compare-z --force-log PATH [arguments...]
+
+Inference commands use the completed 9D force-output stage-2 policy by default.
+TTS reranks complete chunks using the learned ninth force output. By default,
+the target is the sampled candidate baseline plus 0.2 N, capped at 4.0 N, and
+TTS activates at 3.0 N. raw_dp/baseline/dp return the same policy's robot
+actions unchanged while monitoring VisualForce.
+
+Environment overrides: DEVICE, CKPT_PATH, PYTHON_BIN, ROLLOUT_DIR,
+DESIRED_FORCE, ACTIVATION_FORCE, POLICY_FORCE_RISE, SAMPLING_CANDIDATES,
+POLICY_ACTION_STEPS, N_ACTION_STEPS, and ACTION_REFILL_STEPS.
+EOF
+}
+
+require_checkpoint() {
+  if [[ -z "${CKPT_PATH}" ]]; then
+    echo "CKPT_PATH must point to the external reorientation policy checkpoint." >&2
+    exit 1
+  fi
+  normalize_checkpoint_path
+  if [[ ! -f "${CKPT_PATH}" ]]; then
+    echo "Checkpoint not found: ${CKPT_PATH}" >&2
+    exit 1
+  fi
+}
+
+common_args() {
+  build_visualforce_common_args
+  POLICY_ACTION_STEPS="${POLICY_ACTION_STEPS:-16}"
+  tts_build_queue_args
+  COMMON_ARGS+=(
+    "${TTS_QUEUE_ARGS[@]}"
+    --relative-action-scale 1.0
+  )
+}
+
+run_tts() {
+  local desired_force_delta="${1:-${DESIRED_FORCE:-4.0}}"
+  local activation_force="${2:-${ACTIVATION_FORCE:-3.0}}"
+  local policy_force_rise="${POLICY_FORCE_RISE:-0.2}"
+  local gripper_command_max="${FLIP_GRIPPER_COMMAND_MAX:-0.60}"
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/flip_stage2_force_output_tts}"
+  # Flip is a manipulation task: force selection owns the complete arm and
+  # gripper trajectory. Do not inherit a gripper-only profile from the shell.
+  local TTS_SELECTION_SCOPE="full"
+  tts_prepare_inference flip-force-output "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  tts_require_nonnegative POLICY_FORCE_RISE "${policy_force_rise}"
+  tts_require_nonnegative FLIP_GRIPPER_COMMAND_MAX "${gripper_command_max}"
+  require_checkpoint
+  common_args
+  tts_build_manipulation_profile_args \
+    "${desired_force_delta}" \
+    "${activation_force}"
+  TTS_PROFILE_ARGS+=(
+    --tts-policy-force-dynamic-target-rise "${policy_force_rise}"
+  )
+  TTS_PROFILE_TARGET="candidate baseline + ${policy_force_rise} N (cap ${desired_force_delta} N)"
+  tts_print_profile flip-force-output
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    --tts-experiment-profile reorientation \
+    "${TTS_PROFILE_ARGS[@]}" \
+    --tts-policy-force-output \
+    --gripper-command-max "${gripper_command_max}" \
+    --tts-rollout-dir "${rollout_dir}" \
+    "${@:3}"
+}
+
+run_baseline() {
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/flip_stage2_force_output_raw_dp}"
+  tts_prepare_inference flip-raw-dp "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  require_checkpoint
+  common_args
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    --tts-desired-force "${DESIRED_FORCE:-0.2}" \
+    --tts-steering-mode monitor \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_train() {
+  cd "${REPO_ROOT}"
+  WANDB_MODE="${WANDB_MODE:-online}" \
+  "${PYTHON_BIN}" train.py \
+    --config-name=train_diffusion_unet_pick_berries_hybrid_workspace \
+    task=pick_berries_all_image \
+    name=train_diffusion_unet_flip_stage2_relative_obs_anchor_quantile \
+    task.name=flip_obj4_stage2_image \
+    task.dataset_path=data/flip/flip_obj_4_stage2_all \
+    task.dataset.relative_position_action=true \
+    task.dataset.relative_position_action_mode=obs_anchor \
+    task.dataset.action_normalizer_mode=quantile \
+    task.dataset.agent_pos_normalizer_mode=quantile \
+    logging.mode="${WANDB_MODE:-online}" \
+    'logging.tags=[flip_stage2,obs_anchor,quantile]' \
+    training.device="${TRAIN_DEVICE:-cuda:1}" \
+    training.resume=false \
+    "$@"
+}
+
+command_name="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+case "${command_name}" in
+  help|-h|--help) usage ;;
+  tts) run_tts "$@" ;;
+  raw_dp|raw-dp|baseline|dp) run_baseline "$@" ;;
+  checkpoint)
+    require_checkpoint
+    repo_relative_path "${CKPT_PATH}"
+    printf '\n'
+    ;;
+  train) run_train "$@" ;;
+  force-output)
+    exec "${SCRIPT_DIR}/train_flip_force_output.sh" "$@"
+    ;;
+  compare-z)
+    cd "${REPO_ROOT}"
+    exec "${PYTHON_BIN}" tools/flip/compare_flip_z.py "$@"
+    ;;
+  *) echo "Unknown flip command: ${command_name}" >&2; usage >&2; exit 2 ;;
+esac

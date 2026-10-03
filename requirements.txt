@@ -1,0 +1,25 @@
+# Force-estimator dependencies: src/, scripts/, segment_gripper.py.
+#
+# The diffusion-policy side is a separate environment; see
+# third_party/forcelens_dp/conda_environment.yaml (the `robodiff` env).
+#
+# Install a torch build matching your CUDA version first, e.g. for CUDA 12.8:
+#   pip install torch==2.8.0 torchvision==0.23.0 \
+#     --index-url https://download.pytorch.org/whl/cu128
+#
+# Reference environment: Python 3.9.15, torch 2.8.0+cu128, CUDA 12.8.
+
+torch>=2.5.1
+torchvision>=0.20.1
+numpy>=1.23,<2
+opencv-python>=4.6
+av>=10.0
+joblib>=1.2
+matplotlib>=3.6
+tqdm>=4.64
+
+# Imported by the bundled SAM2 submodule, which is loaded from SAM2_ROOT
+# rather than installed as a package.
+hydra-core>=1.3.2
+iopath>=0.1.10
+pillow>=9.2

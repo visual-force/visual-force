@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+
+usage() {
+  cat <<'EOF'
+VisualForce model-development command.
+
+Usage:
+  scripts/visualforce estimator train [ARGS...]
+  scripts/visualforce estimator evaluate [ARGS...]
+  scripts/visualforce estimator analyze [ARGS...]
+  scripts/visualforce critic berry PROFILE [STAGE] [TARGET_MODE]
+  scripts/visualforce critic flip PROFILE [STAGE] [TARGET_MODE]
+  scripts/visualforce critic coke STAGE
+
+Examples:
+  scripts/visualforce estimator train --data-dir data/my_collection
+  scripts/visualforce critic berry action_only future_peak
+  scripts/visualforce critic flip stage2 dry-run max_delta
+  scripts/visualforce critic coke validate
+
+Use the selected command's --help for its full options. Set PYTHON_BIN and
+DEVICE in the environment when a non-default interpreter or GPU is needed.
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 0
+fi
+
+GROUP="$1"
+shift
+
+case "${GROUP}" in
+  estimator)
+    COMMAND="${1:-help}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    cd "${REPO_ROOT}"
+    case "${COMMAND}" in
+      train) exec "${PYTHON_BIN}" scripts/train.py "$@" ;;
+      evaluate|eval) exec "${PYTHON_BIN}" scripts/evaluate.py "$@" ;;
+      analyze) exec "${PYTHON_BIN}" scripts/analyze_dataset.py "$@" ;;
+      help|-h|--help) usage ;;
+      *) echo "Unknown estimator command: ${COMMAND}" >&2; usage >&2; exit 2 ;;
+    esac
+    ;;
+  critic)
+    TASK="${1:-help}"
+    if [[ $# -gt 0 ]]; then shift; fi
+    case "${TASK}" in
+      berry) exec "${SCRIPT_DIR}/train_berry_force_critic.sh" "$@" ;;
+      flip) exec "${SCRIPT_DIR}/train_flip_force_critic.sh" "$@" ;;
+      coke) exec "${SCRIPT_DIR}/train_coke_delta_force.sh" "$@" ;;
+      help|-h|--help) usage ;;
+      *) echo "Unknown critic task: ${TASK}" >&2; usage >&2; exit 2 ;;
+    esac
+    ;;
+  help|-h|--help) usage ;;
+  *) echo "Unknown command group: ${GROUP}" >&2; usage >&2; exit 2 ;;
+esac

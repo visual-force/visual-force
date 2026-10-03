@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+VISUALFORCE_ROOT="${VISUALFORCE_ROOT:-${REPO_ROOT}/../..}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+DEVICE="${DEVICE:-}"
+CKPT_PATH="${CKPT_PATH:-}"
+RAW_DATASET="${RAW_DATASET:-data/plug_insertion_aug}"
+DATASET_PATH="${DATASET_PATH:-data/insert/plug_insertion_aug_force_output}"
+PSEUDO_LABEL_NAME="${PSEUDO_LABEL_NAME:-visualforce_pseudo_force_fz.npz}"
+PREVIEW_DIR="${PREVIEW_DIR:-${VISUALFORCE_ROOT}/reports/plug_insertion_aug_force_output_preview}"
+MASK_MODE="${MASK_MODE:-sam2}"
+TRAIN_NAME="${TRAIN_NAME:-train_diffusion_unet_insert_plug_aug_force_output}"
+TASK_NAME="${TASK_NAME:-plug_insertion_aug_force_output_image}"
+TRAIN_TAGS="${TRAIN_TAGS:-[plug,insertion_aug,force_output,pseudo_fz,quantile]}"
+DEFAULT_CKPT_PATH=""
+
+source "${SCRIPT_DIR}/lib/common.sh"
+visualforce_init_paths
+source "${SCRIPT_DIR}/lib/tts_profiles.sh"
+
+dataset_abs_path() {
+  if [[ "${DATASET_PATH}" == /* ]]; then
+    printf '%s' "${DATASET_PATH}"
+  else
+    printf '%s/%s' "${REPO_ROOT}" "${DATASET_PATH}"
+  fi
+}
+
+build_dataset() {
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" tools/plug/build_plug_insertion_aug_dataset.py \
+    --source "${RAW_DATASET}" \
+    --output "${DATASET_PATH}" \
+    --overwrite
+}
+
+label_dataset() {
+  local dataset_abs label_device
+  dataset_abs="$(dataset_abs_path)"
+  label_device="${LABEL_DEVICE:-${DEVICE:-cuda:1}}"
+  if [[ ! -d "${dataset_abs}/episodes" ]]; then
+    echo "Dataset view not found: ${dataset_abs}" >&2
+    echo "Run 'scripts/plug build' first." >&2
+    return 1
+  fi
+  cd "${VISUALFORCE_ROOT}"
+  "${PYTHON_BIN}" scripts/precompute_flip_pseudo_force.py \
+    --dataset-path "${dataset_abs}" \
+    --visualforce-ckpt "${VISUALFORCE_CKPT}" \
+    --output-name "${PSEUDO_LABEL_NAME}" \
+    --force-keys Fz \
+    --mask-mode "${MASK_MODE}" \
+    --sam2-model small \
+    --sam2-repo "${SAM2_ROOT}" \
+    --sam2-ckpt "${SAM2_CKPT}" \
+    --device "${label_device}" \
+    --batch-size 64 \
+    --preview-dir "${PREVIEW_DIR}" \
+    --preview-frames 6
+}
+
+validate_dataset() {
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" tools/plug/validate_plug_force_output_dataset.py \
+    --dataset "${DATASET_PATH}" \
+    --label-name "${PSEUDO_LABEL_NAME}" \
+    --force-key Fz
+}
+
+resolve_checkpoint() {
+  if [[ -z "${CKPT_PATH}" ]]; then
+    echo "CKPT_PATH must point to the external plug-insertion policy checkpoint." >&2
+    exit 1
+  fi
+  normalize_checkpoint_path
+  if [[ ! -f "${CKPT_PATH}" ]]; then
+    echo "Plug diffusion-policy checkpoint not found: ${CKPT_PATH}" >&2
+    echo "Pass a compatible 9D force-output checkpoint with CKPT_PATH." >&2
+    exit 1
+  fi
+}
+
+run_train() {
+  if [[ "${DRY_RUN:-0}" != "1" ]]; then
+    validate_dataset
+  fi
+  cd "${REPO_ROOT}"
+  WANDB_MODE="${WANDB_MODE:-offline}" \
+  WANDB_DISABLE_SERVICE="${WANDB_DISABLE_SERVICE:-true}" \
+  "${PYTHON_BIN}" train.py \
+    --config-name=train_diffusion_unet_insert_plug_hybrid_workspace \
+    name="${TRAIN_NAME}" \
+    task.name="${TASK_NAME}" \
+    task.dataset.dataset_path="${DATASET_PATH}" \
+    'task.shape_meta.action.shape=[9]' \
+    +task.dataset.append_force_to_action=true \
+    +task.dataset.force_label_name="${PSEUDO_LABEL_NAME}" \
+    +task.dataset.force_key=Fz \
+    +task.dataset.force_mode=magnitude \
+    task.dataset.action_normalizer_mode=quantile \
+    +task.dataset.gripper_action_normalizer_mode=limits \
+    task.dataset.agent_pos_normalizer_mode=quantile \
+    training.device="${TRAIN_DEVICE:-cuda:1}" \
+    training.resume=false \
+    logging.mode="${WANDB_MODE:-offline}" \
+    logging.tags="${TRAIN_TAGS}" \
+    "$@"
+}
+
+run_baseline() {
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/plug_insertion_baseline}"
+  tts_prepare_inference plug-baseline "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  VISUALFORCE_ARGS_AFTER_ROOT=(
+    --tts-desired-force "${DESIRED_FORCE:-12.0}"
+  )
+  build_visualforce_common_args
+  tts_build_queue_args
+  COMMON_ARGS+=("${TTS_QUEUE_ARGS[@]}")
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    --tts-force-target-mode absolute \
+    --tts-steering-mode monitor \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+run_tts() {
+  local desired_force_target="${1:-${DESIRED_FORCE:-12.0}}"
+  local policy_force_rise="${POLICY_FORCE_RISE:-1.23}"
+  local candidates="${SAMPLING_CANDIDATES:-32}"
+  local score_steps="${SCORE_STEPS:-4}"
+  local rollout_dir="${ROLLOUT_DIR:-${VISUALFORCE_ROOT}/rollouts/plug_insertion_tts}"
+  if (( $# > 0 )); then shift; fi
+  tts_require_nonnegative desired_force_target "${desired_force_target}"
+  tts_require_nonnegative POLICY_FORCE_RISE "${policy_force_rise}"
+  tts_require_positive_integer SAMPLING_CANDIDATES "${candidates}"
+  tts_require_positive_integer SCORE_STEPS "${score_steps}"
+  tts_prepare_inference plug "${TTS_MIN_GPU_FREE_MIB:-12000}"
+  resolve_checkpoint
+  build_visualforce_common_args
+  tts_build_queue_args
+  COMMON_ARGS+=("${TTS_QUEUE_ARGS[@]}")
+  TTS_PROFILE_ARGS=(
+    --tts-experiment-profile plug_insertion
+    --tts-desired-force "${desired_force_target}"
+    --tts-force-target-mode absolute
+    --tts-steering-mode sample
+    --tts-selection-scope full
+    --tts-sampling-candidates "${candidates}"
+    --tts-sampling-score-steps "${score_steps}"
+    --tts-policy-force-output
+    --tts-policy-force-dynamic-target-rise "${policy_force_rise}"
+    --tts-log-candidates
+  )
+  TTS_PROFILE_NAME="insertion-policy-sampling"
+  TTS_PROFILE_TARGET="candidate baseline + ${policy_force_rise} N (cap ${desired_force_target} N)"
+  TTS_PROFILE_CANDIDATES="${candidates}"
+  tts_print_profile plug
+  echo 'Plug TTS reranks complete learned action chunks; it is not an axial-force safety controller.' >&2
+  cd "${REPO_ROOT}"
+  "${PYTHON_BIN}" policy_server.py \
+    "${COMMON_ARGS[@]}" \
+    "${TTS_PROFILE_ARGS[@]}" \
+    --tts-rollout-dir "${rollout_dir}" \
+    "$@"
+}
+
+case "${1:-help}" in
+  baseline|dp) shift; run_baseline "$@" ;;
+  tts) shift; run_tts "$@" ;;
+  train)
+    shift
+    run_train "$@"
+    ;;
+  build) build_dataset ;;
+  label) label_dataset ;;
+  validate) validate_dataset ;;
+  all)
+    shift
+    build_dataset
+    label_dataset
+    validate_dataset
+    run_train "$@"
+    ;;
+  dry-run)
+    shift
+    DRY_RUN=1 PYTHON_BIN=/bin/echo run_train "$@"
+    ;;
+  checkpoint)
+    resolve_checkpoint
+    repo_relative_path "${CKPT_PATH}"
+    printf '\n'
+    ;;
+  help|-h|--help)
+    printf '%s\n' \
+      'Plug commands:' \
+      '  scripts/plug tts [terminal_force_cap]' \
+      '  scripts/plug baseline' \
+      '  scripts/plug build' \
+      '  scripts/plug label' \
+      '  scripts/plug validate' \
+      '  scripts/plug train [Hydra overrides...]' \
+      '  scripts/plug all [Hydra overrides...]' \
+      '  scripts/plug dry-run [Hydra overrides...]' \
+      '  scripts/plug checkpoint' \
+      '' \
+      'tts samples 32 complete learned action chunks and selects one by the' \
+      'policy force output. Its dynamic target is the median sampled first-step' \
+      'force plus 1.23 N, capped at 12 N. baseline uses the same frozen checkpoint and' \
+      'queue settings with VisualForce monitoring only.' \
+      '' \
+      'build creates a validated manifest-backed view of both successful and' \
+      'failed augmented demonstrations. label adds frozen-VisualForce pseudo Fz.' \
+      'train fits a 9D policy: eight robot actions plus |Fz|.' \
+      '' \
+      'Inference overrides: CKPT_PATH, DEVICE, DESIRED_FORCE, ROLLOUT_DIR,' \
+      '  POLICY_FORCE_RISE,' \
+      '  SAMPLING_CANDIDATES, SCORE_STEPS, POLICY_ACTION_STEPS,' \
+      '  N_ACTION_STEPS, ACTION_REFILL_STEPS, and TTS_MIN_GPU_FREE_MIB.' \
+      'Training overrides: RAW_DATASET, DATASET_PATH, PSEUDO_LABEL_NAME,' \
+      '  PREVIEW_DIR, MASK_MODE, TRAIN_NAME, TASK_NAME, TRAIN_TAGS,' \
+      '  LABEL_DEVICE, TRAIN_DEVICE, PYTHON_BIN, and WANDB_MODE.'
+    ;;
+  *) echo "Unknown plug command: $1" >&2; exit 2 ;;
+esac
